@@ -35,7 +35,8 @@ function App() {
       // Filter out empty filters
       const validFilters = filters.filter(f => f.field && f.value);
 
-      const response = await axios.post('http://localhost:8000/search', {
+      // Use relative URL to leverage proxy configuration in package.json
+      const response = await axios.post('/search', {
         keywords: keywords || null,
         filters: validFilters,
         filter_operator: filterOperator

@@ -7,9 +7,10 @@ from pydantic import BaseModel
 app = FastAPI(title="Tender Search API")
 
 # Configure CORS for React frontend
+# Note: In production, replace "*" with specific origins like ["http://localhost:3000", "https://yourdomain.com"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["http://localhost:3000", "http://localhost:8000"],  # Restrict to known origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
