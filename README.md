@@ -37,13 +37,20 @@ find_tender/
 ## Installation
 
 ### Backend Setup
+0. Start virtualenv (optional)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
 
-1. Install Python dependencies:
+2. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
-### Frontend Setup
+or
+```bash
+python -m pip install -r requirements.txt
+```## Frontend Setup
 
 1. Navigate to the frontend directory:
 ```bash
@@ -61,7 +68,7 @@ npm install
 
 From the root directory:
 ```bash
-python main.py
+uvicorn backend.main:app --reload --port 8000
 ```
 
 The API will be available at `http://localhost:8000`
