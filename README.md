@@ -129,6 +129,47 @@ curl -X POST http://localhost:8000/search \
     "filter_operator": "OR"
   }'
 ```
+## Clone Database Endpoint
+
+### Overview
+
+The `/admin/clone_database` endpoint fetches tender contracts from the Find a Tender API and saves them to a local JSON file (`data/tender_contracts_dump.json`). It uses **content-based deduplication** (SHA256 hashing) to prevent duplicates.
+
+### Endpoint: `POST /admin/clone_database`
+
+**Parameters:**
+- `total` (int, default: `-1`): Max contracts to fetch. Use `-1` to fetch all available data (unlimited).
+- `stages` (optional): Filter by stage (`planning`, `tender`, or `award`)
+- `updatedFrom` (optional): Start date filter (`YYYY-MM-DDTHH:MM:SS`)
+- `updatedTo` (optional): End date filter (`YYYY-MM-DDTHH:MM:SS`)
+- `background` (bool, default: `false`): Run in background and return immediately
+
+### Usage Examples
+
+**Test with 5 contracts (synchronous):**
+```bash
+curl -X POST "http://localhost:8000/admin/clone_database?total=5"
+```
+
+**Fetch all available contracts (unlimited):**
+```bash
+curl -X POST "http://localhost:8000/admin/clone_database?total=-1"
+```
+
+**Fetch 100 planning stage contracts (synchronous):**
+```bash
+curl -X POST "http://localhost:8000/admin/clone_database?total=5"
+```
+
+**Run in background (returns immediately, monitor status separately):**
+```bash
+curl -X POST "http://localhost:8000/admin/clone_database?total=-1&background=true"
+```
+
+**Check background operation status:**
+```bash
+curl "http://localhost:8000/admin/clone_status/{operation_id}"
+```
 
 ## Filter Logic
 
@@ -178,11 +219,3 @@ Changes will hot-reload automatically when running `npm start`.
 - **React**: JavaScript library for building user interfaces
 - **Axios**: Promise-based HTTP client
 - **CSS3**: Modern styling with flexbox and gradients
-
-## License
-
-This project is open source and available under the MIT License.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
