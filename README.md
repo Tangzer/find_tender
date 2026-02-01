@@ -28,6 +28,21 @@ find_tender/
 └── README.md
 ```
 
+#### SHORTCUTS
+### Start the Backend Server
+From the root directory:
+```bash
+uvicorn backend.main:app --reload --port 8000
+```
+**Run in background (returns immediately, monitor status separately):**
+```bash
+curl -X POST "http://localhost:8000/admin/clone_database?total=-1&background=true"
+```
+**Check background operation status:**
+```bash
+curl "http://localhost:8000/admin/clone_status/{operation_id}"
+```
+
 ## Prerequisites
 
 - Python 3.8 or higher
@@ -133,7 +148,7 @@ curl -X POST http://localhost:8000/search \
 
 ### Overview
 
-The `/admin/clone_database` endpoint fetches tender contracts from the Find a Tender API and saves them to a local JSON file (`data/tender_contracts_dump.json`). It uses **content-based deduplication** (SHA256 hashing) to prevent duplicates.
+The `/admin/clone_database` endpoint fetches tender contracts from the Find a Tender API and writes a raw, append-only clone under `data/clones/<operation_id>/`. It uses **content-based deduplication** (SHA256 hashing) to prevent duplicates while preserving the exact API payloads. This raw clone is the authoritative mirror of the upstream API and is later used to build an optimized copy.
 
 ### Endpoint: `POST /admin/clone_database`
 
@@ -170,6 +185,24 @@ curl -X POST "http://localhost:8000/admin/clone_database?total=-1&background=tru
 ```bash
 curl "http://localhost:8000/admin/clone_status/{operation_id}"
 ```
+
+### Clone Output Structure (Raw Mirror)
+
+Each clone creates a self-contained folder at `data/clones/<operation_id>/`:
+
+- `objects/sha256/*.json.gz`: Gzipped raw JSON payloads, keyed by SHA256 of the canonical JSON bytes. This is the exact upstream data, stored once per unique payload.
+- `events/part-000001.ndjson` (and subsequent parts): Line-delimited JSON events for every fetched release. Each event records `fetched_at`, `cursor`, `page`, `ocid`, `content_hash`, and upstream version metadata. Parts rotate at ~100MB to keep files manageable.
+- `checkpoint.json`: Resume state for long-running jobs (cursor, page counts, counters, fixed filters). Used to continue a clone safely after interruption.
+- `status.json`: The latest runtime status or final result for the operation (progress, errors, or completion).
+- `manifest.json`: Final summary describing parameters, stats, timing, and layout.
+
+Why this structure:
+- **Exact upstream mirror**: Raw objects are stored unmodified, so the clone always reflects the API database.
+- **Dedup without loss**: The content hash prevents duplicates while keeping every fetch recorded via events.
+- **Auditable & replayable**: Events provide a full fetch log and let us rebuild or validate an optimized copy deterministically.
+- **Resumable**: Checkpoints allow safe restarts for large data pulls.
+
+Important rule: treat the raw clone as immutable. Any normalization, indexing, or enrichment must happen in a separate optimized copy so the raw store continues to match the upstream API.
 
 ## Filter Logic
 

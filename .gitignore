@@ -23,6 +23,7 @@ MANIFEST
 venv/
 env/
 ENV/
+data/
 
 # React / Node
 node_modules/
@@ -38,6 +39,7 @@ build/
 .env.development.local
 .env.test.local
 .env.production.local
+.env
 
 # IDE
 .vscode/
