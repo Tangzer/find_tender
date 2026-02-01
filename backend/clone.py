@@ -12,6 +12,8 @@ from typing import Optional, Any, Dict, Callable
 
 from fastapi import FastAPI, Query, HTTPException
 
+Path("logs").mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] [%(name)s] %(levelname)s: %(message)s',

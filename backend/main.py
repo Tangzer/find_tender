@@ -4,9 +4,11 @@ import hashlib
 import httpx
 import os
 import logging
+import json
 import random
+import math
 from datetime import datetime
-from typing import Optional, Literal, Any, Dict
+from typing import Optional, Literal, Any, Dict, List
 from urllib.parse import urlparse, parse_qs
 
 from dotenv import load_dotenv
@@ -142,6 +144,18 @@ def _safe_get(d: dict, *keys, default=None):
     return cur
 
 
+def _sanitize_json(obj: Any) -> Any:
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
 def _build_full_text(release: dict) -> str:
     parts = []
     ocid = release.get("ocid")
@@ -150,6 +164,9 @@ def _build_full_text(release: dict) -> str:
 
     tender = release.get("tender", {})
     parts.extend([tender.get("title"), tender.get("description"), tender.get("mainProcurementCategory")])
+
+    classification = tender.get("classification", {}) or {}
+    parts.extend([classification.get("id"), classification.get("description")])
 
     buyer = release.get("buyer", {})
     parts.append(buyer.get("name"))
@@ -167,6 +184,42 @@ def _build_full_text(release: dict) -> str:
         parts.append(lot.get("description"))
 
     return "\n".join([p for p in parts if p])
+
+
+def _extract_cpv_list(release: dict) -> List[str]:
+    cpv_values: List[str] = []
+    tender = release.get("tender", {}) or {}
+
+    classification = tender.get("classification", {}) or {}
+    classification_id = classification.get("id")
+    if classification_id:
+        cpv_values.append(str(classification_id))
+
+    additional_classifications = tender.get("additionalClassifications", []) or []
+    for c in additional_classifications:
+        cid = c.get("id")
+        if cid:
+            cpv_values.append(str(cid))
+
+    items = tender.get("items", []) or []
+    for it in items:
+        for c in it.get("additionalClassifications", []) or []:
+            cid = c.get("id")
+            if cid:
+                cpv_values.append(str(cid))
+
+    if not cpv_values:
+        return []
+
+    # Keep order but remove duplicates
+    seen = set()
+    deduped = []
+    for cpv in cpv_values:
+        if cpv in seen:
+            continue
+        seen.add(cpv)
+        deduped.append(cpv)
+    return deduped
 
 
 def _extract_query_param(url: Optional[str], name: str) -> Optional[str]:
@@ -215,12 +268,12 @@ async def search(
             sql = """
                 SELECT ocid, title, description, published_at, url,
                     ts_rank_cd(
-                        to_tsvector('english', coalesce(full_text, '')),
-                        phraseto_tsquery('english', $1)
+                        coalesce(search_tsv, to_tsvector('english'::regconfig, coalesce(full_text, ''))),
+                        phraseto_tsquery('english'::regconfig, $1)
                     ) AS score
                 FROM tenders
-                WHERE to_tsvector('english', coalesce(full_text, ''))
-                    @@ phraseto_tsquery('english', $1)
+                WHERE coalesce(search_tsv, to_tsvector('english'::regconfig, coalesce(full_text, '')))
+                    @@ phraseto_tsquery('english'::regconfig, $1)
                 ORDER BY score DESC, published_at DESC NULLS LAST
                 LIMIT $2;
             """
@@ -230,14 +283,14 @@ async def search(
                 SELECT ocid, title, description, published_at, url,
                     GREATEST(
                         ts_rank_cd(
-                            to_tsvector('english', coalesce(full_text, '')),
-                            websearch_to_tsquery('english', $1)
+                            coalesce(search_tsv, to_tsvector('english'::regconfig, coalesce(full_text, ''))),
+                            websearch_to_tsquery('english'::regconfig, $1)
                         ),
                         similarity(coalesce(full_text, ''), $1)
                     ) AS score
                 FROM tenders
-                WHERE to_tsvector('english', coalesce(full_text, ''))
-                    @@ websearch_to_tsquery('english', $1)
+                WHERE coalesce(search_tsv, to_tsvector('english'::regconfig, coalesce(full_text, '')))
+                    @@ websearch_to_tsquery('english'::regconfig, $1)
                     OR similarity(coalesce(full_text, ''), $1) > 0.20
                 ORDER BY score DESC, published_at DESC NULLS LAST
                 LIMIT $2;
@@ -319,11 +372,21 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
                         break
 
                 full_text = _build_full_text(rel)
+                cpv = _extract_cpv_list(rel)
                 source_hash = _hash_source(rel)
+                rel_json = json.dumps(_sanitize_json(rel), ensure_ascii=False, allow_nan=False)
 
                 sql = """
-                    INSERT INTO tenders (ocid, title, description, full_text, published_at, url, source_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    INSERT INTO tenders (
+                        ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8::text[], $9::jsonb,
+                        setweight(to_tsvector('english'::regconfig, coalesce($2, '')), 'A') ||
+                        setweight(to_tsvector('english'::regconfig, coalesce($3, '')), 'B') ||
+                        setweight(to_tsvector('english'::regconfig, coalesce(array_to_string($8::text[], ' '), '')), 'B') ||
+                        setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C')
+                    )
                     ON CONFLICT (ocid) DO UPDATE SET
                         title = EXCLUDED.title,
                         description = EXCLUDED.description,
@@ -331,12 +394,15 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
                         published_at = EXCLUDED.published_at,
                         url = EXCLUDED.url,
                         source_hash = EXCLUDED.source_hash,
+                        cpv = EXCLUDED.cpv,
+                        data = EXCLUDED.data,
+                        search_tsv = EXCLUDED.search_tsv,
                         updated_at = NOW()
                     RETURNING (xmax = 0) AS inserted;
                 """
 
                 row = await conn.fetchrow(
-                    sql, ocid, title, description, full_text, published_at, url_doc, source_hash
+                    sql, ocid, title, description, full_text, published_at, url_doc, source_hash, cpv, rel_json
                 )
                 if row and row["inserted"]:
                     inserted += 1
@@ -420,11 +486,21 @@ async def ingest_notices(
                             break
 
                     full_text = _build_full_text(rel)
+                    cpv = _extract_cpv_list(rel)
                     source_hash = _hash_source(rel)
+                    rel_json = json.dumps(_sanitize_json(rel), ensure_ascii=False, allow_nan=False)
 
                     sql = """
-                        INSERT INTO tenders (ocid, title, description, full_text, published_at, url, source_hash)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        INSERT INTO tenders (
+                            ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8::text[], $9::jsonb,
+                            setweight(to_tsvector('english'::regconfig, coalesce($2, '')), 'A') ||
+                            setweight(to_tsvector('english'::regconfig, coalesce($3, '')), 'B') ||
+                            setweight(to_tsvector('english'::regconfig, coalesce(array_to_string($8::text[], ' '), '')), 'B') ||
+                            setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C')
+                        )
                         ON CONFLICT (ocid) DO UPDATE SET
                             title = EXCLUDED.title,
                             description = EXCLUDED.description,
@@ -432,12 +508,15 @@ async def ingest_notices(
                             published_at = EXCLUDED.published_at,
                             url = EXCLUDED.url,
                             source_hash = EXCLUDED.source_hash,
+                            cpv = EXCLUDED.cpv,
+                            data = EXCLUDED.data,
+                            search_tsv = EXCLUDED.search_tsv,
                             updated_at = NOW()
                         RETURNING (xmax = 0) AS inserted;
                     """
 
                     row = await conn.fetchrow(
-                        sql, ocid, title, description, full_text, published_at, url_doc, source_hash
+                        sql, ocid, title, description, full_text, published_at, url_doc, source_hash, cpv, rel_json
                     )
                     if row and row["inserted"]:
                         inserted_total += 1
@@ -467,7 +546,10 @@ async def ingest_notices(
 # ---------------------------
 # Clone subsystem (moved to clone.py)
 # ---------------------------
-from .clone import register_clone_routes
+try:
+    from .clone import register_clone_routes
+except ImportError:
+    from clone import register_clone_routes
 
 register_clone_routes(
     app,
