@@ -414,7 +414,7 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
 
 @app.post("/admin/ingest")
 async def ingest_notices(
-        total: int = Query(200, ge=1, le=5000),
+        total: int = Query(200, ge=-1, le=5000),
         stages: Optional[Stage] = Query(None),
         updatedFrom: Optional[str] = Query(None, max_length=19),
         updatedTo: Optional[str] = Query(None, max_length=19),
@@ -422,8 +422,8 @@ async def ingest_notices(
     pool = _require_db_pool()
     url = f"{FIND_TENDER_BASE_URL}/api/{FIND_TENDER_VERSION}/ocdsReleasePackages"
 
-    remaining = total
-    api_limit = 100 if total > 100 else total
+    remaining = total if total > 0 else float("inf")
+    api_limit = 100 if total > 100 or total <= 0 else total
     cursor: Optional[str] = None
 
     received_total = 0
@@ -437,7 +437,9 @@ async def ingest_notices(
             fixed_updated_from: Optional[str] = updatedFrom
             fixed_stages: Optional[Stage] = stages
 
-            while remaining > 0:
+            while True:
+                if remaining != float("inf") and remaining <= 0:
+                    break
                 params: Dict[str, Any] = {"limit": api_limit}
                 if cursor:
                     params["cursor"] = cursor
@@ -461,7 +463,10 @@ async def ingest_notices(
 
                 pages += 1
                 received_total += len(releases)
-                page_releases = releases[:remaining]
+                if remaining == float("inf"):
+                    page_releases = releases
+                else:
+                    page_releases = releases[:remaining]
 
                 for rel in page_releases:
                     ocid = rel.get("ocid")
@@ -523,9 +528,10 @@ async def ingest_notices(
                     else:
                         updated_total += 1
 
-                remaining -= len(page_releases)
-                if remaining <= 0:
-                    break
+                if remaining != float("inf"):
+                    remaining -= len(page_releases)
+                    if remaining <= 0:
+                        break
 
                 cursor = data.get("nextCursor")
                 if not cursor:
