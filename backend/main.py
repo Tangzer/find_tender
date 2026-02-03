@@ -418,6 +418,7 @@ async def ingest_notices(
         stages: Optional[Stage] = Query(None),
         updatedFrom: Optional[str] = Query(None, max_length=19),
         updatedTo: Optional[str] = Query(None, max_length=19),
+        commit_every: int = Query(1, ge=1, le=100),
 ):
     pool = _require_db_pool()
     url = f"{FIND_TENDER_BASE_URL}/api/{FIND_TENDER_VERSION}/ocdsReleasePackages"
@@ -432,112 +433,133 @@ async def ingest_notices(
     pages = 0
 
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            fixed_updated_to: Optional[str] = updatedTo
-            fixed_updated_from: Optional[str] = updatedFrom
-            fixed_stages: Optional[Stage] = stages
+        fixed_updated_to: Optional[str] = updatedTo
+        fixed_updated_from: Optional[str] = updatedFrom
+        fixed_stages: Optional[Stage] = stages
 
-            while True:
-                if remaining != float("inf") and remaining <= 0:
-                    break
-                params: Dict[str, Any] = {"limit": api_limit}
-                if cursor:
-                    params["cursor"] = cursor
-                if fixed_stages:
-                    params["stages"] = fixed_stages
-                if fixed_updated_from:
-                    params["updatedFrom"] = fixed_updated_from
-                if fixed_updated_to:
-                    params["updatedTo"] = fixed_updated_to
+        done = False
+        while not done:
+            if remaining != float("inf") and remaining <= 0:
+                break
 
-                data = await get_json_with_retry(url, params)
-
-                if fixed_updated_to is None:
-                    fixed_updated_to = _extract_query_param(data.get("uri"), "updatedTo")
-                    if fixed_updated_to is None:
-                        fixed_updated_to = _extract_query_param(_safe_get(data, "links", "next"), "updatedTo")
-
-                releases = data.get("releases", []) or []
-                if not releases:
-                    break
-
-                pages += 1
-                received_total += len(releases)
-                if remaining == float("inf"):
-                    page_releases = releases
-                else:
-                    page_releases = releases[:remaining]
-
-                for rel in page_releases:
-                    ocid = rel.get("ocid")
-                    if not ocid:
-                        continue
-
-                    tender = rel.get("tender", {})
-                    title = tender.get("title")
-                    description = tender.get("description")
-
-                    published_at = rel.get("date") or data.get("publishedDate")
-                    if published_at:
-                        try:
-                            published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-                        except Exception:
-                            published_at = None
-
-                    url_doc = None
-                    for doc in tender.get("documents", []) or []:
-                        if doc.get("url"):
-                            url_doc = doc.get("url")
-                            break
-
-                    full_text = _build_full_text(rel)
-                    cpv = _extract_cpv_list(rel)
-                    source_hash = _hash_source(rel)
-                    rel_json = json.dumps(_sanitize_json(rel), ensure_ascii=False, allow_nan=False)
-
-                    sql = """
-                        INSERT INTO tenders (
-                            ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv
-                        )
-                        VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8::text[], $9::jsonb,
-                            setweight(to_tsvector('english'::regconfig, coalesce($2, '')), 'A') ||
-                            setweight(to_tsvector('english'::regconfig, coalesce($3, '')), 'B') ||
-                            setweight(to_tsvector('english'::regconfig, coalesce(array_to_string($8::text[], ' '), '')), 'B') ||
-                            setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C')
-                        )
-                        ON CONFLICT (ocid) DO UPDATE SET
-                            title = EXCLUDED.title,
-                            description = EXCLUDED.description,
-                            full_text = EXCLUDED.full_text,
-                            published_at = EXCLUDED.published_at,
-                            url = EXCLUDED.url,
-                            source_hash = EXCLUDED.source_hash,
-                            cpv = EXCLUDED.cpv,
-                            data = EXCLUDED.data,
-                            search_tsv = EXCLUDED.search_tsv,
-                            updated_at = NOW()
-                        RETURNING (xmax = 0) AS inserted;
-                    """
-
-                    row = await conn.fetchrow(
-                        sql, ocid, title, description, full_text, published_at, url_doc, source_hash, cpv, rel_json
-                    )
-                    if row and row["inserted"]:
-                        inserted_total += 1
-                    else:
-                        updated_total += 1
-
-                if remaining != float("inf"):
-                    remaining -= len(page_releases)
-                    if remaining <= 0:
+            async with conn.transaction():
+                for _ in range(commit_every):
+                    if remaining != float("inf") and remaining <= 0:
+                        done = True
                         break
 
-                cursor = data.get("nextCursor")
-                if not cursor:
-                    cursor = _extract_cursor(_safe_get(data, "links", "next"))
-                if not cursor:
-                    break
+                    params: Dict[str, Any] = {"limit": api_limit}
+                    if cursor:
+                        params["cursor"] = cursor
+                    if fixed_stages:
+                        params["stages"] = fixed_stages
+                    if fixed_updated_from:
+                        params["updatedFrom"] = fixed_updated_from
+                    if fixed_updated_to:
+                        params["updatedTo"] = fixed_updated_to
+
+                    data = await get_json_with_retry(url, params)
+
+                    if fixed_updated_to is None:
+                        fixed_updated_to = _extract_query_param(data.get("uri"), "updatedTo")
+                        if fixed_updated_to is None:
+                            fixed_updated_to = _extract_query_param(_safe_get(data, "links", "next"), "updatedTo")
+
+                    releases = data.get("releases", []) or []
+                    if not releases:
+                        done = True
+                        break
+
+                    pages += 1
+                    received_total += len(releases)
+                    inserted_page = 0
+                    updated_page = 0
+                    if remaining == float("inf"):
+                        page_releases = releases
+                    else:
+                        page_releases = releases[:remaining]
+
+                    for rel in page_releases:
+                        ocid = rel.get("ocid")
+                        if not ocid:
+                            continue
+
+                        tender = rel.get("tender", {})
+                        title = tender.get("title")
+                        description = tender.get("description")
+
+                        published_at = rel.get("date") or data.get("publishedDate")
+                        if published_at:
+                            try:
+                                published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                            except Exception:
+                                published_at = None
+
+                        url_doc = None
+                        for doc in tender.get("documents", []) or []:
+                            if doc.get("url"):
+                                url_doc = doc.get("url")
+                                break
+
+                        full_text = _build_full_text(rel)
+                        cpv = _extract_cpv_list(rel)
+                        source_hash = _hash_source(rel)
+                        rel_json = json.dumps(_sanitize_json(rel), ensure_ascii=False, allow_nan=False)
+
+                        sql = """
+                            INSERT INTO tenders (
+                                ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv
+                            )
+                            VALUES (
+                                $1, $2, $3, $4, $5, $6, $7, $8::text[], $9::jsonb,
+                                setweight(to_tsvector('english'::regconfig, coalesce($2, '')), 'A') ||
+                                setweight(to_tsvector('english'::regconfig, coalesce($3, '')), 'B') ||
+                                setweight(to_tsvector('english'::regconfig, coalesce(array_to_string($8::text[], ' '), '')), 'B') ||
+                                setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C')
+                            )
+                            ON CONFLICT (ocid) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                description = EXCLUDED.description,
+                                full_text = EXCLUDED.full_text,
+                                published_at = EXCLUDED.published_at,
+                                url = EXCLUDED.url,
+                                source_hash = EXCLUDED.source_hash,
+                                cpv = EXCLUDED.cpv,
+                                data = EXCLUDED.data,
+                                search_tsv = EXCLUDED.search_tsv,
+                                updated_at = NOW()
+                            RETURNING (xmax = 0) AS inserted;
+                        """
+
+                        row = await conn.fetchrow(
+                            sql, ocid, title, description, full_text, published_at, url_doc, source_hash, cpv, rel_json
+                        )
+                        if row and row["inserted"]:
+                            inserted_total += 1
+                            inserted_page += 1
+                        else:
+                            updated_total += 1
+                            updated_page += 1
+
+                    print(
+                        f"\033[36m[ingest]\033[0m page={pages} "
+                        f"inserted={inserted_page} updated={updated_page} "
+                        f"total_inserted={inserted_total} total_updated={updated_total} "
+                        f"cursor={cursor or '-'}"
+                    )
+
+                    if remaining != float("inf"):
+                        remaining -= len(page_releases)
+                        if remaining <= 0:
+                            done = True
+                            break
+
+                    cursor = data.get("nextCursor")
+                    if not cursor:
+                        cursor = _extract_cursor(_safe_get(data, "links", "next"))
+                    if not cursor:
+                        done = True
+                        break
 
     return {
         "requested": total,

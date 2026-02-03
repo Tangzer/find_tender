@@ -150,9 +150,19 @@ First page (20 by default):
 curl -sS -X POST "http://127.0.0.1:8000/admin/ingest/first"
 ```
 
+Commit per page (default):
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/admin/ingest?total=2000&commit_every=1"
+```
+
 N pages (API is 100/page, so 20 pages ≈ 2000):
 ```bash
 curl -sS -X POST "http://127.0.0.1:8000/admin/ingest?total=2000"
+```
+
+Batch commits every 5 pages:
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/admin/ingest?total=2000&commit_every=5"
 ```
 
 ## Clone Database Endpoint
