@@ -222,6 +222,44 @@ def _extract_cpv_list(release: dict) -> List[str]:
     return deduped
 
 
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _dedupe_keep_order(values: List[Any]) -> List[Any]:
+    seen = set()
+    deduped = []
+    for v in values:
+        if v in seen:
+            continue
+        seen.add(v)
+        deduped.append(v)
+    return deduped
+
+
+def _extract_notice_info(release: dict) -> tuple[Optional[str], Optional[str], Optional[datetime], Optional[str]]:
+    tender = release.get("tender", {}) or {}
+    candidates = list(tender.get("documents", []) or [])
+    for contract in release.get("contracts", []) or []:
+        candidates.extend(contract.get("documents", []) or [])
+
+    for doc in candidates:
+        url = doc.get("url")
+        if not url:
+            continue
+        notice_type = doc.get("noticeType") or doc.get("documentType")
+        notice_date = _parse_iso_datetime(doc.get("datePublished"))
+        notice_format = doc.get("format")
+        return url, notice_type, notice_date, notice_format
+
+    return None, None, None, None
+
+
 def _extract_query_param(url: Optional[str], name: str) -> Optional[str]:
     if not url:
         return None
@@ -358,18 +396,104 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
                 title = tender.get("title")
                 description = tender.get("description")
 
-                published_at = rel.get("date") or data.get("publishedDate")
-                if published_at:
-                    try:
-                        published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-                    except Exception:
-                        published_at = None
+                published_at = _parse_iso_datetime(rel.get("date") or data.get("publishedDate"))
+                release_date = _parse_iso_datetime(rel.get("date"))
+                release_id = rel.get("id")
+                release_tags = rel.get("tag") or []
+                if isinstance(release_tags, str):
+                    release_tags = [release_tags]
+                initiation_type = rel.get("initiationType")
+                language = rel.get("language")
 
-                url_doc = None
-                for doc in tender.get("documents", []) or []:
-                    if doc.get("url"):
-                        url_doc = doc.get("url")
-                        break
+                buyer = rel.get("buyer", {}) or {}
+                buyer_id = buyer.get("id")
+                buyer_name = buyer.get("name")
+
+                tender_id = tender.get("id")
+                tender_status = tender.get("status")
+                procurement_method = tender.get("procurementMethod")
+                procurement_method_details = tender.get("procurementMethodDetails")
+                special_regime = tender.get("specialRegime") or []
+                if isinstance(special_regime, str):
+                    special_regime = [special_regime]
+
+                legal_basis = tender.get("legalBasis", {}) or {}
+                legal_basis_id = legal_basis.get("id")
+                legal_basis_scheme = legal_basis.get("scheme")
+                legal_basis_uri = legal_basis.get("uri")
+
+                lot_ids = []
+                lot_statuses = []
+                for lot in tender.get("lots", []) or []:
+                    if lot.get("id"):
+                        lot_ids.append(str(lot.get("id")))
+                    if lot.get("status"):
+                        lot_statuses.append(str(lot.get("status")))
+                lot_ids = _dedupe_keep_order(lot_ids)
+                lot_statuses = _dedupe_keep_order(lot_statuses)
+
+                award_ids = []
+                award_statuses = []
+                supplier_ids = []
+                supplier_names = []
+                main_procurement_category = None
+                for award in rel.get("awards", []) or []:
+                    if award.get("id"):
+                        award_ids.append(str(award.get("id")))
+                    if award.get("status"):
+                        award_statuses.append(str(award.get("status")))
+                    if not main_procurement_category and award.get("mainProcurementCategory"):
+                        main_procurement_category = award.get("mainProcurementCategory")
+                    for supplier in award.get("suppliers", []) or []:
+                        if supplier.get("id"):
+                            supplier_ids.append(str(supplier.get("id")))
+                        if supplier.get("name"):
+                            supplier_names.append(str(supplier.get("name")))
+
+                if not main_procurement_category:
+                    main_procurement_category = tender.get("mainProcurementCategory")
+
+                award_ids = _dedupe_keep_order(award_ids)
+                award_statuses = _dedupe_keep_order(award_statuses)
+                supplier_ids = _dedupe_keep_order(supplier_ids)
+                supplier_names = _dedupe_keep_order(supplier_names)
+
+                contract_ids = []
+                contract_statuses = []
+                contract_date_signed = None
+                contract_start_date = None
+                contract_end_date = None
+                contract_value_amount = None
+                contract_value_amount_gross = None
+                contract_value_currency = None
+                contract_above_threshold = None
+                for contract in rel.get("contracts", []) or []:
+                    if contract.get("id"):
+                        contract_ids.append(str(contract.get("id")))
+                    if contract.get("status"):
+                        contract_statuses.append(str(contract.get("status")))
+                    if contract_date_signed is None:
+                        contract_date_signed = _parse_iso_datetime(contract.get("dateSigned"))
+                    period = contract.get("period", {}) or {}
+                    if contract_start_date is None:
+                        contract_start_date = _parse_iso_datetime(period.get("startDate"))
+                    if contract_end_date is None:
+                        contract_end_date = _parse_iso_datetime(period.get("endDate"))
+                    value = contract.get("value", {}) or {}
+                    if contract_value_amount is None:
+                        contract_value_amount = value.get("amount")
+                    if contract_value_amount_gross is None:
+                        contract_value_amount_gross = value.get("amountGross")
+                    if contract_value_currency is None:
+                        contract_value_currency = value.get("currency")
+                    if contract_above_threshold is None and contract.get("aboveThreshold") is not None:
+                        contract_above_threshold = bool(contract.get("aboveThreshold"))
+
+                contract_ids = _dedupe_keep_order(contract_ids)
+                contract_statuses = _dedupe_keep_order(contract_statuses)
+
+                notice_url, notice_type, notice_date_published, notice_format = _extract_notice_info(rel)
+                url_doc = notice_url
 
                 full_text = _build_full_text(rel)
                 cpv = _extract_cpv_list(rel)
@@ -378,14 +502,32 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
 
                 sql = """
                     INSERT INTO tenders (
-                        ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv
+                        ocid, title, description, full_text, published_at, url, source_hash, cpv, data, search_tsv,
+                        release_id, release_date, release_tags, initiation_type, language,
+                        buyer_id, buyer_name,
+                        tender_id, tender_status, procurement_method, procurement_method_details, special_regime,
+                        legal_basis_id, legal_basis_scheme, legal_basis_uri,
+                        lot_ids, lot_statuses,
+                        award_ids, award_statuses, main_procurement_category, supplier_ids, supplier_names,
+                        contract_ids, contract_statuses, contract_date_signed, contract_start_date, contract_end_date,
+                        contract_value_amount, contract_value_amount_gross, contract_value_currency, contract_above_threshold,
+                        notice_url, notice_type, notice_date_published, notice_format
                     )
                     VALUES (
                         $1, $2, $3, $4, $5, $6, $7, $8::text[], $9::jsonb,
                         setweight(to_tsvector('english'::regconfig, coalesce($2, '')), 'A') ||
                         setweight(to_tsvector('english'::regconfig, coalesce($3, '')), 'B') ||
                         setweight(to_tsvector('english'::regconfig, coalesce(array_to_string($8::text[], ' '), '')), 'B') ||
-                        setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C')
+                        setweight(to_tsvector('english'::regconfig, coalesce($4, '')), 'C'),
+                        $10, $11, $12::text[], $13, $14,
+                        $15, $16,
+                        $17, $18, $19, $20, $21::text[],
+                        $22, $23, $24,
+                        $25::text[], $26::text[],
+                        $27::text[], $28::text[], $29, $30::text[], $31::text[],
+                        $32::text[], $33::text[], $34, $35, $36,
+                        $37, $38, $39, $40,
+                        $41, $42, $43, $44
                     )
                     ON CONFLICT (ocid) DO UPDATE SET
                         title = EXCLUDED.title,
@@ -397,12 +539,91 @@ async def ingest_first_notices(limit: int = Query(20, ge=1, le=100)):
                         cpv = EXCLUDED.cpv,
                         data = EXCLUDED.data,
                         search_tsv = EXCLUDED.search_tsv,
+                        release_id = EXCLUDED.release_id,
+                        release_date = EXCLUDED.release_date,
+                        release_tags = EXCLUDED.release_tags,
+                        initiation_type = EXCLUDED.initiation_type,
+                        language = EXCLUDED.language,
+                        buyer_id = EXCLUDED.buyer_id,
+                        buyer_name = EXCLUDED.buyer_name,
+                        tender_id = EXCLUDED.tender_id,
+                        tender_status = EXCLUDED.tender_status,
+                        procurement_method = EXCLUDED.procurement_method,
+                        procurement_method_details = EXCLUDED.procurement_method_details,
+                        special_regime = EXCLUDED.special_regime,
+                        legal_basis_id = EXCLUDED.legal_basis_id,
+                        legal_basis_scheme = EXCLUDED.legal_basis_scheme,
+                        legal_basis_uri = EXCLUDED.legal_basis_uri,
+                        lot_ids = EXCLUDED.lot_ids,
+                        lot_statuses = EXCLUDED.lot_statuses,
+                        award_ids = EXCLUDED.award_ids,
+                        award_statuses = EXCLUDED.award_statuses,
+                        main_procurement_category = EXCLUDED.main_procurement_category,
+                        supplier_ids = EXCLUDED.supplier_ids,
+                        supplier_names = EXCLUDED.supplier_names,
+                        contract_ids = EXCLUDED.contract_ids,
+                        contract_statuses = EXCLUDED.contract_statuses,
+                        contract_date_signed = EXCLUDED.contract_date_signed,
+                        contract_start_date = EXCLUDED.contract_start_date,
+                        contract_end_date = EXCLUDED.contract_end_date,
+                        contract_value_amount = EXCLUDED.contract_value_amount,
+                        contract_value_amount_gross = EXCLUDED.contract_value_amount_gross,
+                        contract_value_currency = EXCLUDED.contract_value_currency,
+                        contract_above_threshold = EXCLUDED.contract_above_threshold,
+                        notice_url = EXCLUDED.notice_url,
+                        notice_type = EXCLUDED.notice_type,
+                        notice_date_published = EXCLUDED.notice_date_published,
+                        notice_format = EXCLUDED.notice_format,
                         updated_at = NOW()
                     RETURNING (xmax = 0) AS inserted;
                 """
 
                 row = await conn.fetchrow(
-                    sql, ocid, title, description, full_text, published_at, url_doc, source_hash, cpv, rel_json
+                    sql,
+                    ocid,
+                    title,
+                    description,
+                    full_text,
+                    published_at,
+                    url_doc,
+                    source_hash,
+                    cpv,
+                    rel_json,
+                    release_id,
+                    release_date,
+                    release_tags,
+                    initiation_type,
+                    language,
+                    buyer_id,
+                    buyer_name,
+                    tender_id,
+                    tender_status,
+                    procurement_method,
+                    procurement_method_details,
+                    special_regime,
+                    legal_basis_id,
+                    legal_basis_scheme,
+                    legal_basis_uri,
+                    lot_ids,
+                    lot_statuses,
+                    award_ids,
+                    award_statuses,
+                    main_procurement_category,
+                    supplier_ids,
+                    supplier_names,
+                    contract_ids,
+                    contract_statuses,
+                    contract_date_signed,
+                    contract_start_date,
+                    contract_end_date,
+                    contract_value_amount,
+                    contract_value_amount_gross,
+                    contract_value_currency,
+                    contract_above_threshold,
+                    notice_url,
+                    notice_type,
+                    notice_date_published,
+                    notice_format,
                 )
                 if row and row["inserted"]:
                     inserted += 1
