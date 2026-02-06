@@ -180,7 +180,7 @@ Parameters:
 - `updatedTo` (optional): End date filter (`YYYY-MM-DDTHH:MM:SS`)
 - `background` (bool, default: `false`): Run in background and return immediately
 
-Usage examples:
+Usage examples of cloning:
 
 Test with 5 contracts (synchronous):
 ```bash

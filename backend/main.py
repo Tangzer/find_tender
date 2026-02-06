@@ -312,7 +312,7 @@ async def search(
 
 @app.get("/tenders")
 async def list_tenders(
-        limit: int = Query(5, ge=1, le=100),
+        limit: int = Query(1, ge=1, le=100),
         cursor: Optional[str] = Query(None, max_length=300),
         updatedFrom: Optional[str] = Query(None, max_length=19),
         updatedTo: Optional[str] = Query(None, max_length=19),
@@ -418,7 +418,7 @@ async def ingest_notices(
         stages: Optional[Stage] = Query(None),
         updatedFrom: Optional[str] = Query(None, max_length=19),
         updatedTo: Optional[str] = Query(None, max_length=19),
-        commit_every: int = Query(1, ge=1, le=100),
+        commit_every: int = Query(1, ge=1, le=10000),
 ):
     pool = _require_db_pool()
     url = f"{FIND_TENDER_BASE_URL}/api/{FIND_TENDER_VERSION}/ocdsReleasePackages"
